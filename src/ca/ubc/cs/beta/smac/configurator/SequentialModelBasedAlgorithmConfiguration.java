@@ -49,6 +49,16 @@ import ca.ubc.cs.beta.aeatk.termination.CompositeTerminationCondition;
 import ca.ubc.cs.beta.models.fastrf.RandomForest;
 import static ca.ubc.cs.beta.aeatk.misc.math.ArrayMathOps.*;
 
+// Sample Run Configuration: 
+// --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB  --rf-split-min 1  --mask-inactive-conditional-parameters-as-default-value false --fullTreeBootstrap true
+
+// still only finds about -20      --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB --rf-split-min 1 --mask-inactive-conditional-parameters-as-default-value false --ignoreConditionality true
+// finds -100 in 100 evaluations:  --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB --rf-split-min 1 --mask-inactive-conditional-parameters-as-default-value false --ignoreConditionality false
+// finds -100 in 100 evaluations:  --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB --rf-split-min 1 --mask-inactive-conditional-parameters-as-default-value true --ignoreConditionality false
+// finds -100 in ~60 evaluations:  --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB --rf-split-min 1 --mask-inactive-conditional-parameters-as-default-value true --ignoreConditionality true
+
+// without sideways moves: -35:   --scenarioFile /home/frank/git/SMAC/deployables/example_scenarios/leadingones/leadingones-100-scenario.txt --log-level debug --log-all-call-strings true --intensification-percentage 0 --acq-func LCB --rf-split-min 1 --mask-inactive-conditional-parameters-as-default-value true --ignoreConditionality true --allow-sideways-moves false
+
 public class SequentialModelBasedAlgorithmConfiguration extends
 		AbstractAlgorithmFramework {
 
@@ -483,9 +493,10 @@ public class SequentialModelBasedAlgorithmConfiguration extends
 		while(true)
 		{
 			localSearchSteps++;
-			if(localSearchSteps % 1000 == 0)
+			if(options.allowSidewaysMoves && localSearchSteps % options.numberOfLsStepsIfSideways == 0) 
 			{
-				log.warn("Local Search has done {} iterations, possible infinite loop", localSearchSteps );
+				break; // if we're accepting sideways moves, we won't typically stop due to being in a local min, but after these many steps.
+//				log.warn("Local Search has done {} iterations, possible infinite loop", localSearchSteps );
 			}
 			
 			//=== Get EI of current configuration.
@@ -509,8 +520,16 @@ public class SequentialModelBasedAlgorithmConfiguration extends
 				}
 			}
 		
-			//=== If significant improvement then move to one of the best neighbours; otherwise break.   
-			if(min >= currentMinEI - epsilon)
+			boolean stoppingConditionSatisfied = false;
+			if (options.allowSidewaysMoves){
+				//=== If significant worsening then stop; otherwise move to one of the best neighbours.   
+				stoppingConditionSatisfied = (min >= currentMinEI + epsilon);
+			} else {
+				//=== If no significant improvement then stop; otherwise move to one of the best neighbours.   
+				stoppingConditionSatisfied = (min >= currentMinEI - epsilon);
+			}
+			
+			if(stoppingConditionSatisfied)
 			{
 				break;
 			} else
@@ -538,8 +557,9 @@ public class SequentialModelBasedAlgorithmConfiguration extends
 				//==== Matlab code always uses the min even if we didn't select it.
 				//incumbentEIC = new ParamWithEI(min, best);
 				
-				double[][] next = { best.toValueArray() };
-				double[][] predictions = transpose(applyMarginalModel(next));
+				List<ParameterConfiguration> configList = new ArrayList<ParameterConfiguration>();
+				configList.add(best);
+				double[][] predictions = transpose(applyMarginalModel(configList));
 				double[] mean = predictions[0];
 				double[] var = predictions[1];
 				
@@ -551,17 +571,44 @@ public class SequentialModelBasedAlgorithmConfiguration extends
 		
 		return incumbentEIC;
 	}
+	
 
 	/**
-	 * Computes a marginal prediction across all instances for the configArrays.
-	 * @param configArrays
+	 * Computes a marginal prediction across all instances for the configs. 
+	 * @param configs
 	 * @return
 	 */
-	protected double[][] applyMarginalModel(double[][] configArrays)
+	public double[][] applyMarginalModel(List<ParameterConfiguration> configs)
 	{
+		//=== Translate into array format, and call method for that format.
+		
+		double[][] configArrays = new double[configs.size()][];
+		int i=0; 
+		double[] defaultValues = configSpace.getDefaultConfiguration().toValueArray();
+		
+		for(ParameterConfiguration config: configs)
+		{
+			//=== FH in February 2017: also replace inactive parameters with their default here at prediction time (missing before).
+			if(smacConfig.mbOptions.maskInactiveConditionalParametersAsDefaultValue)
+			{
+				configArrays[i] = config.toComparisonValueArray();
+				for (int j = 0; j < defaultValues.length; j++) {
+					if (Double.isNaN(configArrays[i][j])){
+						configArrays[i][j] = defaultValues[j];  
+					}
+				}
+			} else
+			{
+				configArrays[i] = config.toValueArray();
+			}
+			i++;
+		}
+		
+		
+		
 		//=== Use all trees.
 		int[] treeIdxsToUse = new int[forest.numTrees];
-		for(int i=0; i <  forest.numTrees; i++)
+		for(i=0; i <  forest.numTrees; i++)
 		{
 			treeIdxsToUse[i]=i;
 		}
@@ -574,26 +621,7 @@ public class SequentialModelBasedAlgorithmConfiguration extends
 		{
 			return RandomForest.applyMarginal(forest,treeIdxsToUse,configArrays,sanitizedData.getPCAFeatures());
 		}
-		
-	}
-	
-	/**
-	 * Computes a marginal prediction across all instances for the configs. 
-	 * @param configs
-	 * @return
-	 */
-	protected double[][] applyMarginalModel(List<ParameterConfiguration> configs)
-	{
-		//=== Translate into array format, and call method for that format.
-		
-		double[][] configArrays = new double[configs.size()][];
-		int i=0; 
-		for(ParameterConfiguration config: configs)
-		{
-			configArrays[i] = config.toValueArray();
-			i++;
-		}
-		return applyMarginalModel(configArrays);		
+
 	}
 	
 	@Override
